@@ -1,22 +1,23 @@
 import json
-from openai import OpenAI
-import streamlit as st
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
 import os
 import boto3
 from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModel
 import torch
-from typing import List
+import streamlit as st
+from langchain.schema import HumanMessage
+from langchain_core.prompts import PromptTemplate
+from langchain_community.chat_models import ChatOpenAI
 
 load_dotenv()
-openai_api_key = os.getenv("OPENAI_API_KEY")
 
 # Load environment variables
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
 AWS_REGION = os.getenv("AWS_REGION")
+OPENAPI_KEY = os.getenv("OPENAI_API_KEY")
 
 # Connect to OpenSearch
 def connect_to_opensearch():
@@ -37,87 +38,90 @@ def connect_to_opensearch():
         connection_class=RequestsHttpConnection,
         pool_maxsize=30
     )
+    print(client)
+    if client.ping():
+        print('Connected to OpenSearch')
+    else:
+        print("failed",client.info())
     return client
 
-# Generate query vector using a sentence transformer model
-def get_query_vector(text):
-    tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-    model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-    inputs = tokenizer(text, return_tensors="pt")
-    with torch.no_grad():
-        outputs = model(**inputs)
-    # Convert tensor to list of floats
-    return outputs.last_hidden_state.mean(dim=1).squeeze().tolist()
 
-# Perform a KNN search in OpenSearch
-def search_opensearch(client, query_vector):
-    print("query_vector",query_vector)
-    query = {
-        "size": 5,
-        # "query": {
-        #     "knn": {
-        #         "field": "text_vector",
-        #         "query_vector": query_vector,
-        #         "k": 5
-        #     }
-        # }
-        "query": {
-   "script_score": {
-     "query": {
-       "match_all": {}
-     },
-     "script": {
-       "source": "knn_score",
-       "lang": "knn",
-       "params": {
-         "field": "text_vector",
-         "query_value": [2.0, 3.0, 5.0, 6.0],
-         "space_type": "cosinesimil"
-         
-       }
-     }
-   }
- }
-    }
+
+def search_opensearch(client, index, query_text, model_id, size=5):
+    """
+    Perform a search in OpenSearch using a neural query.
+
+    Args:
+        client (OpenSearch): The OpenSearch client object.
+        index (str): The index to search in.
+        query_text (str): The query text to search for.
+        model_id (str): The model ID used for vector search.
+        size (int): The number of top results to return. Default is 5.
+
+    Returns:
+        list: A list of text content from the matching documents.
+    """
     try:
-        response = client.search(body=query, index='confluence_kb')
+        # Perform the search
+        response = client.search(
+            index=index,
+            body={
+                "_source": {"excludes": ["text_vector"]},
+                "size": size,
+                "query": {
+                    "neural": {
+                        "text_vector": {
+                            "query_text": query_text,
+                            "model_id": model_id,
+                            "k": size
+                        }
+                    }
+                }
+            }
+        )
+        # Extract relevant documents
+        hits = response['hits']['hits']
+        documents = [hit['_source']['text'] for hit in hits]
+        return documents
     except Exception as e:
-        print("Error:", e)
-        return
-    return response['hits']['hits']
+        print(f"Error during OpenSearch query: {e}")
+        return []
+
 
 # Initialize Streamlit app
 st.title("💬 Chatbot with OpenSearch")
 st.caption("🚀 A Streamlit chatbot powered by OpenAI and OpenSearch")
 
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state["messages"] = [{"role": "assistant", "content": "How can I help you?"}]
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
-
+# Process user input
 if prompt := st.chat_input():
-    # Append user message
+    # Append user message to history
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.chat_message("user").write(prompt)
     
-    # Initialize OpenAI client
-    client = OpenAI(api_key=openai_api_key)
-    
-    # Ask the model if it should query the knowledge base
-    guidance_prompt = f"Does the following request require information from a knowledge base? '{prompt}'"
-    guidance_response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "system", "content": guidance_prompt}]
+    # Determine whether to use knowledge base or OpenAI
+    chat = ChatOpenAI(api_key=OPENAPI_KEY, model="gpt-4-0125-preview")
+    guidance_prompt_template = PromptTemplate(
+        input_variables=["user_query"],
+        template=(
+            "You are a smart assistant. When given a user query, decide if it requires looking up information in the "
+            "knowledge base or generating a direct response. "
+            "Respond with 'search knowledge base' if you need to search or 'generate response' otherwise.\n"
+            "User query: {user_query}"
+        )
     )
-    
-    if "yes" in guidance_response.choices[0].message.content.lower():
-        # Generate query vector
-        query_vector = get_query_vector(prompt)
-        
-        # Perform the OpenSearch query
+    guidance_prompt = guidance_prompt_template.format(user_query=prompt)
+    guidance_response = chat([HumanMessage(content=guidance_prompt)]).content.strip().lower()
+
+    if "search knowledge base" in guidance_response:
+        # Connect to OpenSearch and search knowledge base
         client = connect_to_opensearch()
-        results = search_opensearch(client, query_vector)
+        results = search_opensearch(client, prompt)
         client.transport.close()
         
         # Format and display search results
@@ -127,15 +131,11 @@ if prompt := st.chat_input():
                 response_content += f"- {result['_source']['title']}: {result['_source']['content'][:100]}...\n"
         else:
             response_content = "No relevant documents found in the knowledge base."
-        
-        st.session_state.messages.append({"role": "assistant", "content": response_content})
-        st.chat_message("assistant").write(response_content)
     else:
-        # Use OpenAI for general conversation
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=st.session_state.messages
-        )
-        msg = response.choices[0].message.content
-        st.session_state.messages.append({"role": "assistant", "content": msg})
-        st.chat_message("assistant").write(msg)
+        # Generate direct response using OpenAI
+        response = chat([HumanMessage(content=prompt)])
+        response_content = response.content
+
+    # Append assistant's message to chat history and display
+    st.session_state.messages.append({"role": "assistant", "content": response_content})
+    st.chat_message("assistant").write(response_content)
